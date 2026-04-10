@@ -9,6 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import streamlit as st
 from PIL import Image
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
+from pypdf import PdfReader, PdfWriter
 
 st.set_page_config(page_title="Bulk Image PDF Tool", page_icon="📄", layout="wide")
 
@@ -21,9 +24,6 @@ LETTER_PORTRAIT = (612, 792)
 LETTER_LANDSCAPE = (792, 612)
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def sanitize_filename(name: str) -> str:
     name = str(name).strip().replace("\x00", "")
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
@@ -72,7 +72,6 @@ def get_extension_from_content_type(content_type: str) -> str:
         "image/bmp": ".bmp",
         "image/tiff": ".tif",
         "image/x-icon": ".ico",
-        "application/pdf": ".pdf",
     }
     return mapping.get(content_type, "")
 
@@ -108,7 +107,7 @@ def make_unique_name(filename: str, used_names: set) -> str:
 
 def convert_image_name_to_sds(name: str) -> str:
     base = sanitize_filename(get_base_name(name))
-    base = re.sub(r"_(ISP_?\d+|ISPXX|IMG\d*|IMAGE\d*|IMAGE|IMG)$", "", base, flags=re.I)
+    base = re.sub(r"_(ISP_?\d+|ISPXX|ISPXX_?\d*|IMG\d*|IMAGE\d*|IMAGE|IMG)$", "", base, flags=re.I)
     base = re.sub(r"_+$", "", base)
     if not re.search(r"_SDS$", base, flags=re.I):
         base = base + "_SDS"
@@ -189,6 +188,7 @@ def fetch_image(url: str) -> dict:
     data = content.getvalue()
 
     return {
+        "source_type": "url",
         "url": url,
         "final_url": response.url,
         "status": "success",
@@ -206,11 +206,12 @@ def fetch_wrapper(url: str) -> dict:
         return fetch_image(url)
     except Exception as e:
         return {
+            "source_type": "url",
             "url": url,
             "final_url": "",
             "status": "failed",
-            "original_name": "",
-            "name_source": "",
+            "original_name": get_name_from_url(url),
+            "name_source": "url",
             "content_type": "",
             "http_status": "",
             "error": str(e),
@@ -235,27 +236,63 @@ def load_images(urls: list) -> list:
     return results
 
 
+def load_uploaded_images(files) -> list:
+    items = []
+    for file in files:
+        try:
+            data = file.read()
+            content_type = getattr(file, "type", "") or "image/jpeg"
+            original_name = sanitize_filename(file.name)
+            original_name = ensure_extension(original_name, content_type, original_name)
+            items.append(
+                {
+                    "source_type": "upload",
+                    "url": "",
+                    "final_url": "",
+                    "status": "success",
+                    "original_name": original_name,
+                    "name_source": "uploaded-file",
+                    "content_type": content_type,
+                    "http_status": "",
+                    "error": "",
+                    "bytes": data,
+                }
+            )
+        except Exception as e:
+            items.append(
+                {
+                    "source_type": "upload",
+                    "url": "",
+                    "final_url": "",
+                    "status": "failed",
+                    "original_name": getattr(file, "name", "uploaded_file"),
+                    "name_source": "uploaded-file",
+                    "content_type": "",
+                    "http_status": "",
+                    "error": str(e),
+                    "bytes": b"",
+                }
+            )
+    return items
+
+
 def get_page_dimensions(page_mode: str, image_width: int, image_height: int):
     if page_mode == "Original image size":
-        return "px", (image_width, image_height)
+        return image_width, image_height
 
     is_landscape = image_width > image_height
     if page_mode == "A4":
-        return "pt", A4_LANDSCAPE if is_landscape else A4_PORTRAIT
-    return "pt", LETTER_LANDSCAPE if is_landscape else LETTER_PORTRAIT
+        return A4_LANDSCAPE if is_landscape else A4_PORTRAIT
+    return LETTER_LANDSCAPE if is_landscape else LETTER_PORTRAIT
 
 
 def image_bytes_to_pdf_bytes(image_bytes: bytes, page_mode: str, fit_mode: str, margin: int) -> bytes:
-    from reportlab.lib.utils import ImageReader
-    from reportlab.pdfgen import canvas
-
     image = Image.open(io.BytesIO(image_bytes))
     if image.mode in ("RGBA", "P"):
         image = image.convert("RGB")
 
     img_width, img_height = image.size
-    unit, page_size = get_page_dimensions(page_mode, img_width, img_height)
-    page_width, page_height = page_size
+    page_width, page_height = get_page_dimensions(page_mode, img_width, img_height)
 
     if page_mode == "Original image size":
         margin = 0
@@ -293,65 +330,80 @@ def image_bytes_to_pdf_bytes(image_bytes: bytes, page_mode: str, fit_mode: str, 
 
 
 def build_outputs(items: list, output_mode: str, page_mode: str, fit_mode: str, margin: int):
-    used_names = set()
     results_table = []
     zip_buffer = io.BytesIO()
-    merged_pdf_buffer = io.BytesIO()
-    merged_files = []
+    merged_pdf_bytes = None
+
+    success_items = [item for item in items if item["status"] == "success"]
 
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         report_buffer = io.StringIO()
         writer = csv.DictWriter(
             report_buffer,
-            fieldnames=["original_name", "new_name", "status", "name_source", "url", "error"],
+            fieldnames=["source_type", "original_name", "new_name", "status", "name_source", "url", "error"],
         )
         writer.writeheader()
 
-        for item in items:
-            row = {
-                "original_name": item.get("original_name", ""),
-                "new_name": item.get("new_name", ""),
-                "status": item.get("status", ""),
-                "name_source": item.get("name_source", ""),
-                "url": item.get("url", ""),
-                "error": item.get("error", ""),
-            }
-            writer.writerow(row)
-            results_table.append(row)
+        if output_mode in ["Images only", "One PDF per image", "Images + One PDF per image"]:
+            used_names = set()
+            for item in items:
+                row = {
+                    "source_type": item.get("source_type", ""),
+                    "original_name": item.get("original_name", ""),
+                    "new_name": item.get("new_name", ""),
+                    "status": item.get("status", ""),
+                    "name_source": item.get("name_source", ""),
+                    "url": item.get("url", ""),
+                    "error": item.get("error", ""),
+                }
+                writer.writerow(row)
+                results_table.append(row)
 
-            if item["status"] != "success":
-                continue
+                if item["status"] != "success":
+                    continue
 
-            image_name = make_unique_name(item["new_name"] + item["image_ext"], used_names)
-            pdf_name = make_unique_name(item["new_name"] + ".pdf", used_names)
+                image_name = make_unique_name(item["new_name"] + item["image_ext"], used_names)
+                pdf_name = make_unique_name(item["new_name"] + ".pdf", used_names)
 
-            if output_mode == "Images only":
-                zf.writestr(image_name, item["bytes"])
-            elif output_mode == "One PDF per image":
-                pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
-                zf.writestr(pdf_name, pdf_bytes)
-            elif output_mode == "Images + One PDF per image":
-                zf.writestr(image_name, item["bytes"])
-                pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
-                zf.writestr(pdf_name, pdf_bytes)
-            else:
-                merged_files.append((item["new_name"] + ".pdf", item["bytes"]))
+                if output_mode == "Images only":
+                    zf.writestr(image_name, item["bytes"])
+                elif output_mode == "One PDF per image":
+                    pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
+                    zf.writestr(pdf_name, pdf_bytes)
+                elif output_mode == "Images + One PDF per image":
+                    zf.writestr(image_name, item["bytes"])
+                    pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
+                    zf.writestr(pdf_name, pdf_bytes)
+        else:
+            writer_pdf = PdfWriter()
+            for item in items:
+                row = {
+                    "source_type": item.get("source_type", ""),
+                    "original_name": item.get("original_name", ""),
+                    "new_name": item.get("new_name", ""),
+                    "status": item.get("status", ""),
+                    "name_source": item.get("name_source", ""),
+                    "url": item.get("url", ""),
+                    "error": item.get("error", ""),
+                }
+                writer.writerow(row)
+                results_table.append(row)
+
+                if item["status"] != "success":
+                    continue
+
+                single_pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
+                reader = PdfReader(io.BytesIO(single_pdf_bytes))
+                for page in reader.pages:
+                    writer_pdf.add_page(page)
+
+            merged_buffer = io.BytesIO()
+            writer_pdf.write(merged_buffer)
+            merged_buffer.seek(0)
+            merged_pdf_bytes = merged_buffer.getvalue()
+            zf.writestr("merged_output.pdf", merged_pdf_bytes)
 
         zf.writestr("download_report.csv", report_buffer.getvalue().encode("utf-8-sig"))
-
-    merged_pdf_bytes = None
-    if output_mode == "One merged PDF" and merged_files:
-        from pypdf import PdfWriter, PdfReader
-
-        writer = PdfWriter()
-        for _, image_bytes in merged_files:
-            single_pdf_bytes = image_bytes_to_pdf_bytes(image_bytes, page_mode, fit_mode, margin)
-            reader = PdfReader(io.BytesIO(single_pdf_bytes))
-            for page in reader.pages:
-                writer.add_page(page)
-        writer.write(merged_pdf_buffer)
-        merged_pdf_buffer.seek(0)
-        merged_pdf_bytes = merged_pdf_buffer.getvalue()
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue(), merged_pdf_bytes, results_table
@@ -364,9 +416,6 @@ def reset_loaded_state():
     st.session_state["merged_pdf_bytes"] = None
 
 
-# -----------------------------
-# Session state init
-# -----------------------------
 if "loaded_items" not in st.session_state:
     st.session_state["loaded_items"] = []
 if "results_table" not in st.session_state:
@@ -377,27 +426,30 @@ if "merged_pdf_bytes" not in st.session_state:
     st.session_state["merged_pdf_bytes"] = None
 
 
-# -----------------------------
-# UI
-# -----------------------------
 st.title("Bulk Image Downloader and PDF Converter")
-st.caption("Paste image URLs, load original names, rename in bulk, auto-convert IMG naming to SDS, and download files.")
+st.caption("Upload images or paste image URLs, rename row by row, auto-convert IMG naming to SDS, and download PDF output.")
 
 left, right = st.columns(2)
 with left:
     url_text = st.text_area(
         "Paste image URLs",
-        height=220,
+        height=180,
         placeholder="One image URL per line",
     )
 with right:
     uploaded_file = st.file_uploader("Upload TXT or CSV with URLs", type=["txt", "csv"])
 
+uploaded_images = st.file_uploader(
+    "Upload images directly",
+    type=["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"],
+    accept_multiple_files=True,
+)
+
 opt1, opt2, opt3 = st.columns(3)
 with opt1:
     output_mode = st.selectbox(
         "Output mode",
-        ["Images only", "One PDF per image", "One merged PDF", "Images + One PDF per image"],
+        ["One PDF per image", "One merged PDF", "Images only", "Images + One PDF per image"],
     )
 with opt2:
     page_mode = st.selectbox("Page setup", ["A4", "Letter", "Original image size"])
@@ -420,12 +472,19 @@ with load_col1:
             urls.extend(parse_urls_from_uploaded_file(uploaded_file))
         urls = dedupe_keep_order(urls)
 
-        if not urls:
-            st.error("Please paste URLs or upload a file first.")
+        has_uploaded_images = uploaded_images is not None and len(uploaded_images) > 0
+
+        if not urls and not has_uploaded_images:
+            st.error("Please paste URLs, upload a TXT/CSV file, or upload images first.")
         else:
             reset_loaded_state()
+            items = []
             with st.spinner("Loading images and reading names..."):
-                items = load_images(urls)
+                if urls:
+                    items.extend(load_images(urls))
+                if has_uploaded_images:
+                    items.extend(load_uploaded_images(uploaded_images))
+
             for item in items:
                 if item["status"] == "success":
                     item["image_ext"] = Path(item["original_name"]).suffix or get_extension_from_content_type(item["content_type"]) or ".jpg"
@@ -433,6 +492,7 @@ with load_col1:
                 else:
                     item["image_ext"] = ".jpg"
                     item["new_name"] = ""
+
             st.session_state["loaded_items"] = items
             st.success(f"Loaded {len(items)} item(s).")
 with load_col2:
@@ -445,40 +505,29 @@ loaded_items = st.session_state["loaded_items"]
 if loaded_items:
     st.subheader("Rename mapping")
 
-    bulk_col1, bulk_col2, bulk_col3 = st.columns(3)
-    with bulk_col1:
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
         if st.button("Apply SDS naming"):
             for item in loaded_items:
                 if item["status"] == "success":
                     item["new_name"] = convert_image_name_to_sds(item["original_name"])
             st.session_state["loaded_items"] = loaded_items
             st.rerun()
-    with bulk_col2:
+    with action_col2:
         if st.button("Use current names"):
             for item in loaded_items:
                 if item["status"] == "success":
                     item["new_name"] = get_base_name(item["original_name"])
             st.session_state["loaded_items"] = loaded_items
             st.rerun()
-    with bulk_col3:
-        bulk_names = st.text_area("Bulk paste new names", height=100, placeholder="Paste one new name per line")
-        if st.button("Apply pasted names"):
-            names = [sanitize_filename(x) for x in bulk_names.splitlines() if x.strip()]
-            success_items = [x for x in loaded_items if x["status"] == "success"]
-            for idx, name in enumerate(names):
-                if idx < len(success_items):
-                    success_items[idx]["new_name"] = get_base_name(name)
-            st.session_state["loaded_items"] = loaded_items
-            st.rerun()
 
     rows_to_show = st.selectbox("Rows visible", [10, 20, 30, 50], index=1)
-    visible_items = loaded_items[:]
 
     with st.container(border=True):
-        for idx, item in enumerate(visible_items[:rows_to_show]):
-            c1, c2, c3, c4 = st.columns([1, 4, 4, 2])
+        for idx, item in enumerate(loaded_items[:rows_to_show]):
+            c1, c2, c3, c4 = st.columns([1.4, 4.2, 4.2, 1.6])
             with c1:
-                st.write("URL")
+                st.write(item["source_type"].upper())
             with c2:
                 st.text(item["original_name"] if item["original_name"] else item["url"])
             with c3:
@@ -496,7 +545,8 @@ if loaded_items:
                     st.success("OK")
                 else:
                     st.error("Failed")
-        if len(visible_items) > rows_to_show:
+
+        if len(loaded_items) > rows_to_show:
             st.info(f"Showing first {rows_to_show} rows. Increase 'Rows visible' to see more.")
 
     st.session_state["loaded_items"] = loaded_items
@@ -511,6 +561,7 @@ if loaded_items:
                 has_error = True
                 break
             valid_names.append(item["new_name"].lower())
+
         if has_error:
             st.error("All successful rows must have a new file name.")
         elif len(valid_names) != len(set(valid_names)):
@@ -544,7 +595,7 @@ if st.session_state["zip_bytes"] is not None or st.session_state["merged_pdf_byt
             mime="application/zip",
             use_container_width=True,
         )
-    if st.session_state["merged_pdf_bytes"] is not None:
+    if output_mode == "One merged PDF" and st.session_state["merged_pdf_bytes"] is not None:
         st.download_button(
             "Download Merged PDF",
             data=st.session_state["merged_pdf_bytes"],
