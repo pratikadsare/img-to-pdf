@@ -114,37 +114,6 @@ def convert_image_name_to_sds(name: str) -> str:
     return base
 
 
-def parse_urls_from_text(text: str) -> list:
-    urls = []
-    for line in text.splitlines():
-        value = line.strip()
-        if value.startswith("http://") or value.startswith("https://"):
-            urls.append(value)
-    return dedupe_keep_order(urls)
-
-
-def parse_urls_from_uploaded_file(uploaded_file) -> list:
-    raw = uploaded_file.read()
-    try:
-        content = raw.decode("utf-8-sig")
-    except Exception:
-        content = raw.decode("latin-1")
-
-    urls = []
-    if uploaded_file.name.lower().endswith(".csv"):
-        reader = csv.reader(io.StringIO(content))
-        for row in reader:
-            for cell in row:
-                value = cell.strip()
-                if value.startswith("http://") or value.startswith("https://"):
-                    urls.append(value)
-                    break
-    else:
-        urls.extend(parse_urls_from_text(content))
-
-    return dedupe_keep_order(urls)
-
-
 def dedupe_keep_order(items: list) -> list:
     seen = set()
     result = []
@@ -153,6 +122,15 @@ def dedupe_keep_order(items: list) -> list:
             result.append(item)
             seen.add(item)
     return result
+
+
+def parse_urls_from_text(text: str) -> list:
+    urls = []
+    for line in text.splitlines():
+        value = line.strip()
+        if value.startswith("http://") or value.startswith("https://"):
+            urls.append(value)
+    return dedupe_keep_order(urls)
 
 
 def build_session() -> requests.Session:
@@ -221,8 +199,8 @@ def fetch_wrapper(url: str) -> dict:
 
 def load_images(urls: list) -> list:
     results = []
-    progress = st.progress(0)
-    status = st.empty()
+    progress = st.progress(0, text="Loading image URLs...")
+    status_box = st.empty()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_wrapper, url): url for url in urls}
         total = len(futures)
@@ -230,15 +208,19 @@ def load_images(urls: list) -> list:
         for future in as_completed(futures):
             results.append(future.result())
             completed += 1
-            progress.progress(completed / total)
-            status.info(f"Loaded {completed} of {total}")
-    status.success(f"Loaded {completed} of {total}")
+            progress.progress(completed / total, text=f"Loading image URLs... {completed}/{total}")
+            status_box.info(f"Loaded {completed} of {total}")
+    status_box.success(f"Loaded {completed} of {total}")
     return results
 
 
 def load_uploaded_images(files) -> list:
     items = []
-    for file in files:
+    total = len(files)
+    progress = st.progress(0, text="Reading uploaded images...")
+    status_box = st.empty()
+
+    for idx, file in enumerate(files, start=1):
         try:
             data = file.read()
             content_type = getattr(file, "type", "") or "image/jpeg"
@@ -273,6 +255,10 @@ def load_uploaded_images(files) -> list:
                     "bytes": b"",
                 }
             )
+        progress.progress(idx / total, text=f"Reading uploaded images... {idx}/{total}")
+        status_box.info(f"Read {idx} of {total}")
+
+    status_box.success(f"Read {total} of {total}")
     return items
 
 
@@ -334,7 +320,8 @@ def build_outputs(items: list, output_mode: str, page_mode: str, fit_mode: str, 
     zip_buffer = io.BytesIO()
     merged_pdf_bytes = None
 
-    success_items = [item for item in items if item["status"] == "success"]
+    progress = st.progress(0, text="Preparing output...")
+    status_box = st.empty()
 
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         report_buffer = io.StringIO()
@@ -346,7 +333,8 @@ def build_outputs(items: list, output_mode: str, page_mode: str, fit_mode: str, 
 
         if output_mode in ["Images only", "One PDF per image", "Images + One PDF per image"]:
             used_names = set()
-            for item in items:
+            total = len(items)
+            for idx, item in enumerate(items, start=1):
                 row = {
                     "source_type": item.get("source_type", ""),
                     "original_name": item.get("original_name", ""),
@@ -359,24 +347,26 @@ def build_outputs(items: list, output_mode: str, page_mode: str, fit_mode: str, 
                 writer.writerow(row)
                 results_table.append(row)
 
-                if item["status"] != "success":
-                    continue
+                if item["status"] == "success":
+                    image_name = make_unique_name(item["new_name"] + item["image_ext"], used_names)
+                    pdf_name = make_unique_name(item["new_name"] + ".pdf", used_names)
 
-                image_name = make_unique_name(item["new_name"] + item["image_ext"], used_names)
-                pdf_name = make_unique_name(item["new_name"] + ".pdf", used_names)
+                    if output_mode == "Images only":
+                        zf.writestr(image_name, item["bytes"])
+                    elif output_mode == "One PDF per image":
+                        pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
+                        zf.writestr(pdf_name, pdf_bytes)
+                    elif output_mode == "Images + One PDF per image":
+                        zf.writestr(image_name, item["bytes"])
+                        pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
+                        zf.writestr(pdf_name, pdf_bytes)
 
-                if output_mode == "Images only":
-                    zf.writestr(image_name, item["bytes"])
-                elif output_mode == "One PDF per image":
-                    pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
-                    zf.writestr(pdf_name, pdf_bytes)
-                elif output_mode == "Images + One PDF per image":
-                    zf.writestr(image_name, item["bytes"])
-                    pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
-                    zf.writestr(pdf_name, pdf_bytes)
+                progress.progress(idx / total, text=f"Preparing output... {idx}/{total}")
+                status_box.info(f"Processed {idx} of {total}")
         else:
             writer_pdf = PdfWriter()
-            for item in items:
+            total = len(items)
+            for idx, item in enumerate(items, start=1):
                 row = {
                     "source_type": item.get("source_type", ""),
                     "original_name": item.get("original_name", ""),
@@ -389,23 +379,28 @@ def build_outputs(items: list, output_mode: str, page_mode: str, fit_mode: str, 
                 writer.writerow(row)
                 results_table.append(row)
 
-                if item["status"] != "success":
-                    continue
+                if item["status"] == "success":
+                    single_pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
+                    reader = PdfReader(io.BytesIO(single_pdf_bytes))
+                    for page in reader.pages:
+                        writer_pdf.add_page(page)
 
-                single_pdf_bytes = image_bytes_to_pdf_bytes(item["bytes"], page_mode, fit_mode, margin)
-                reader = PdfReader(io.BytesIO(single_pdf_bytes))
-                for page in reader.pages:
-                    writer_pdf.add_page(page)
+                progress.progress(idx / total, text=f"Building merged PDF... {idx}/{total}")
+                status_box.info(f"Processed {idx} of {total}")
 
+            status_box.info("Finalizing merged PDF...")
             merged_buffer = io.BytesIO()
             writer_pdf.write(merged_buffer)
             merged_buffer.seek(0)
             merged_pdf_bytes = merged_buffer.getvalue()
             zf.writestr("merged_output.pdf", merged_pdf_bytes)
 
+        status_box.info("Creating ZIP package...")
         zf.writestr("download_report.csv", report_buffer.getvalue().encode("utf-8-sig"))
 
     zip_buffer.seek(0)
+    progress.progress(1.0, text="Output package ready")
+    status_box.success("ZIP package is ready")
     return zip_buffer.getvalue(), merged_pdf_bytes, results_table
 
 
@@ -427,17 +422,13 @@ if "merged_pdf_bytes" not in st.session_state:
 
 
 st.title("Bulk Image Downloader and PDF Converter")
-st.caption("Upload images or paste image URLs, rename row by row, auto-convert IMG naming to SDS, and download PDF output.")
+st.caption("Upload images or paste image URLs, rename row by row, auto-convert IMG naming to SDS, and download output while the tab stays open.")
 
-left, right = st.columns(2)
-with left:
-    url_text = st.text_area(
-        "Paste image URLs",
-        height=180,
-        placeholder="One image URL per line",
-    )
-with right:
-    uploaded_file = st.file_uploader("Upload TXT or CSV with URLs", type=["txt", "csv"])
+url_text = st.text_area(
+    "Paste image URLs",
+    height=180,
+    placeholder="One image URL per line",
+)
 
 uploaded_images = st.file_uploader(
     "Upload images directly",
@@ -465,17 +456,11 @@ with opt5:
 load_col1, load_col2 = st.columns(2)
 with load_col1:
     if st.button("Load files", type="primary", use_container_width=True):
-        urls = []
-        if url_text.strip():
-            urls.extend(parse_urls_from_text(url_text))
-        if uploaded_file is not None:
-            urls.extend(parse_urls_from_uploaded_file(uploaded_file))
-        urls = dedupe_keep_order(urls)
-
+        urls = parse_urls_from_text(url_text) if url_text.strip() else []
         has_uploaded_images = uploaded_images is not None and len(uploaded_images) > 0
 
         if not urls and not has_uploaded_images:
-            st.error("Please paste URLs, upload a TXT/CSV file, or upload images first.")
+            st.error("Please paste image URLs or upload images first.")
         else:
             reset_loaded_state()
             items = []
@@ -567,7 +552,7 @@ if loaded_items:
         elif len(valid_names) != len(set(valid_names)):
             st.error("Duplicate new file names found. Please make them unique.")
         else:
-            with st.spinner("Processing output files..."):
+            with st.spinner("Processing output files and creating ZIP..."):
                 zip_bytes, merged_pdf_bytes, results_table = build_outputs(
                     loaded_items,
                     output_mode,
@@ -603,6 +588,8 @@ if st.session_state["zip_bytes"] is not None or st.session_state["merged_pdf_byt
             mime="application/pdf",
             use_container_width=True,
         )
+
+st.info("Keep this tab open while processing. In this Streamlit-only version, long jobs are not reliable if the session disconnects or the tab sleeps.")
 
 st.markdown(
     """
